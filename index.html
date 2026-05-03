@@ -109,7 +109,10 @@ input,select{width:100%;min-height:52px;border:3px solid var(--ink);border-radiu
     <div class="gameHero">
       <div class="row" style="justify-content:space-between">
         <button class="btn small ghost" id="backSetupBtn">← 設定</button>
-        <button class="btn small sun" id="newThemeBtn">別のお題</button>
+        <div class="row">
+          <button class="btn small sun" id="newThemeBtn">別のお題</button>
+          <button class="btn small red" id="interruptBtn">中断</button>
+        </div>
       </div>
       <div style="margin-top:14px">
         <div class="questionTitle" id="questionTitle"></div>
@@ -155,6 +158,17 @@ input,select{width:100%;min-height:52px;border:3px solid var(--ink);border-radiu
         <button class="btn ghost" id="reviveBtn">全員復活</button>
       </div>
       <div id="scoreBoard" class="scoreBoard"></div>
+    </div>
+
+    <div class="card answerPanel">
+      <div class="row" style="justify-content:space-between">
+        <h2 style="margin:0">おさらい</h2>
+        <button class="btn small green" id="toggleReviewBtn">出た答えをおさらい</button>
+      </div>
+      <div id="reviewBox" class="hidden" style="margin-top:10px">
+        <div class="notice">このお題で、今までに出た答えだけを表示します。</div>
+        <ul id="reviewList" style="margin:10px 0 0;padding-left:20px;font-weight:1000;line-height:1.7"></ul>
+      </div>
     </div>
 
     <div class="card answerPanel">
@@ -325,14 +339,15 @@ const KOKON_TOZAI_QUESTIONS = [
 ];
 
 const $ = id => document.getElementById(id);
-const DEFAULT_PLAYERS = ["お父さん","お母さん","おねえちゃん","わたし"];
+const DEFAULT_PLAYERS = ["ままうー","とやちん","まっちゃらて","りんりん"];
 let state = {
   players:[],selectedId:null,question:null,current:0,used:new Set(),
-  timerSeconds:15,timerLeft:15,timerRunning:false,timerHandle:null,answersOpen:false,recognition:null
+  timerSeconds:15,timerLeft:15,timerRunning:false,timerHandle:null,answersOpen:false,recognition:null,
+  voiceListening:false,voiceStopping:false,reviewOpen:false,nextTurnHandle:null
 };
 
 function saveSettings(){
-  localStorage.setItem("kokonTozaiDriveSettings_v2", JSON.stringify({
+  localStorage.setItem("kokonTozaiDriveSettings_v3", JSON.stringify({
     players: state.players.map(p=>p.name).filter(Boolean),
     timerSeconds: Number($("timerSelect").value || 0),
     selectedId: state.selectedId
@@ -340,7 +355,7 @@ function saveSettings(){
 }
 function loadSettings(){
   try{
-    const s = JSON.parse(localStorage.getItem("kokonTozaiDriveSettings_v2") || "{}");
+    const s = JSON.parse(localStorage.getItem("kokonTozaiDriveSettings_v3") || "{}");
     const names = Array.isArray(s.players) && s.players.length ? s.players : DEFAULT_PLAYERS;
     state.players = names.map(name=>({name,score:0,active:true}));
     state.timerSeconds = Number.isFinite(Number(s.timerSeconds)) ? Number(s.timerSeconds) : 15;
@@ -378,12 +393,12 @@ function chooseQuestion(){
 function randomQuestion(){ return KOKON_TOZAI_QUESTIONS[Math.floor(Math.random()*KOKON_TOZAI_QUESTIONS.length)]; }
 
 function startGame(){
+  stopAllRuntime();
   saveSettings();
   state.players = state.players.map((p,i)=>({name:p.name || `プレイヤー${i+1}`,score:0,active:true})).filter(p=>p.name);
   if(state.players.length < 2){ alert("2人以上にしてください"); return; }
-  state.question = chooseQuestion(); state.current = 0; state.used = new Set(); state.answersOpen = false;
+  state.question = chooseQuestion(); state.current = 0; state.used = new Set(); state.answersOpen = false; state.reviewOpen = false;
   state.timerSeconds = Number($("timerSelect").value || 0); state.timerLeft = state.timerSeconds;
-  stopTimer();
   $("screenSetup").classList.add("hidden"); $("screenGame").classList.remove("hidden");
   setResult("ここに判定が出ます","");
   renderGame();
@@ -399,7 +414,26 @@ function renderGame(){
   $("timerBtn").textContent = state.timerRunning ? "一時停止" : "タイマー開始";
   $("toggleAnswersBtn").textContent = state.answersOpen ? "閉じる" : "開く";
   $("answersBox").classList.toggle("hidden", !state.answersOpen);
+  $("toggleReviewBtn").textContent = state.reviewOpen ? "おさらいを閉じる" : "出た答えをおさらい";
+  $("reviewBox").classList.toggle("hidden", !state.reviewOpen);
+  renderReview();
   renderScores(); renderAnswers(); checkWinner();
+}
+function renderReview(){
+  const usedAnswers = state.question.answers.filter(ans=>state.used.has(ans.name));
+  const list = $("reviewList");
+  list.innerHTML = "";
+  if(!usedAnswers.length){
+    const li = document.createElement("li");
+    li.textContent = "まだ出ていません";
+    list.append(li);
+    return;
+  }
+  usedAnswers.forEach(ans=>{
+    const li = document.createElement("li");
+    li.textContent = ans.name;
+    list.append(li);
+  });
 }
 function renderScores(){
   const board = $("scoreBoard"); board.innerHTML = "";
@@ -432,6 +466,8 @@ function nextActive(move=true){
   return null;
 }
 function nextTurn(){
+  clearPendingNextTurn();
+  stopVoiceRecognition(true);
   stopTimer(); state.timerLeft = state.timerSeconds; $("answerInput").value = "";
   nextActive(true); renderGame();
 }
@@ -453,7 +489,8 @@ function judgeInput(){
     popConfetti(16);
     setResult(`正解！「${result.answer.name}」`, "ok");
     renderGame();
-    setTimeout(()=>nextTurn(), 900);
+    clearPendingNextTurn();
+    state.nextTurnHandle = setTimeout(()=>{ state.nextTurnHandle = null; nextTurn(); }, 900);
     return;
   }
   if(result.type === "almost"){
@@ -575,10 +612,15 @@ function showHint(){
   setResult(text, "hint");
   speak(text);
 }
+function stopSpeaking(){
+  try{
+    if("speechSynthesis" in window) speechSynthesis.cancel();
+  }catch(e){}
+}
 function speak(text){
   try{
     if(!("speechSynthesis" in window)) return;
-    speechSynthesis.cancel();
+    stopSpeaking();
     const u = new SpeechSynthesisUtterance(text);
     u.lang = "ja-JP"; u.rate = 0.95; u.pitch = 1.05;
     speechSynthesis.speak(u);
@@ -594,21 +636,78 @@ function setupVoice(){
   state.recognition.lang = "ja-JP";
   state.recognition.interimResults = false;
   state.recognition.continuous = false;
-  state.recognition.onstart = ()=>setResult("聞いています…答えを言ってね","hint");
-  state.recognition.onerror = ()=>setResult("音声がうまく聞き取れませんでした。ひらがな入力で試してね","no");
+  state.recognition.onstart = ()=>{
+    state.voiceListening = true;
+    updateVoiceButton();
+    setResult("聞いています…答えを言ってね","hint");
+  };
+  state.recognition.onerror = ()=>{
+    const intentionalStop = state.voiceStopping;
+    state.voiceListening = false;
+    updateVoiceButton();
+    if(!intentionalStop){
+      setResult("音声がうまく聞き取れませんでした。ひらがな入力で試してね","no");
+    }
+  };
   state.recognition.onresult = e=>{
-    const text = e.results[0][0].transcript;
+    const text = (e.results && e.results[0] && e.results[0][0] && e.results[0][0].transcript || "").trim();
+    stopVoiceRecognition(false);
+    if(!text){
+      setResult("うまく聞き取れませんでした。もう一度試してね","no");
+      return;
+    }
     $("answerInput").value = text;
     setResult(`聞こえた答え：${text}`, "hint");
     setTimeout(judgeInput, 250);
   };
+  state.recognition.onend = ()=>{
+    state.voiceListening = false;
+    state.voiceStopping = false;
+    updateVoiceButton();
+  };
 }
-function voiceAnswer(){
+function updateVoiceButton(){
+  const btn = $("voiceBtn");
+  if(!state.recognition){
+    btn.textContent = "🎤 音声非対応";
+    return;
+  }
+  btn.textContent = state.voiceListening ? "聞き取り中…" : "🎤 声で答える";
+}
+function stopVoiceRecognition(useAbort=true){
+  state.voiceStopping = true;
+  state.voiceListening = false;
+  updateVoiceButton();
+  if(!state.recognition){ state.voiceStopping = false; return; }
+  try{
+    useAbort ? state.recognition.abort() : state.recognition.stop();
+  }catch(e){ state.voiceStopping = false; }
+}
+function startVoiceRecognition(){
   if(!state.recognition){
     setResult("このブラウザは音声認識に対応していません。入力欄でスマホのマイク入力を使うのがおすすめです。","no");
     return;
   }
-  try{ state.recognition.start(); }catch(e){ setResult("もう一度マイクボタンを押してね","no"); }
+  if(state.voiceListening){
+    stopVoiceRecognition(true);
+    return;
+  }
+  try{
+    state.voiceStopping = false;
+    state.recognition.start();
+  }catch(e){
+    state.voiceListening = false;
+    updateVoiceButton();
+    setResult("もう一度マイクボタンを押してね","no");
+  }
+}
+function voiceAnswer(){
+  if(state.voiceListening){
+    stopVoiceRecognition(true);
+    setResult("音声認識を中止しました","close");
+    return;
+  }
+  startVoiceRecognition();
 }
 function checkWinner(){
   const active = state.players.filter(p=>p.active);
@@ -629,11 +728,28 @@ function startOrPauseTimer(){
 function stopTimer(){ state.timerRunning = false; if(state.timerHandle) clearInterval(state.timerHandle); state.timerHandle = null; }
 function resetTimer(){ stopTimer(); state.timerLeft = state.timerSeconds; renderGame(); }
 function newTheme(){
+  stopAllRuntime();
   state.question = randomQuestion(); state.used = new Set(); state.players.forEach(p=>{p.active=true;p.score=0;}); state.current = 0;
-  stopTimer(); state.timerLeft = state.timerSeconds; state.answersOpen = false; $("answerInput").value = "";
+  stopTimer(); state.timerLeft = state.timerSeconds; state.answersOpen = false; state.reviewOpen = false; $("answerInput").value = "";
   setResult("新しいお題です！","hint"); renderGame();
 }
-function backSetup(){ stopTimer(); $("screenGame").classList.add("hidden"); $("screenSetup").classList.remove("hidden"); $("statusPill").textContent = "準備中"; renderPlayers(); renderCategories(); }
+function backSetup(){
+  stopAllRuntime();
+  $("screenGame").classList.add("hidden"); $("screenSetup").classList.remove("hidden"); $("statusPill").textContent = "準備中"; renderPlayers(); renderCategories();
+}
+function interruptGame(){
+  if(!confirm("このゲームを中断してメニューに戻りますか？")) return;
+  state.used = new Set();
+  state.current = 0;
+  state.answersOpen = false;
+  state.reviewOpen = false;
+  state.players = state.players.map((p,i)=>({name:p.name || `プレイヤー${i+1}`,score:0,active:true}));
+  stopAllRuntime();
+  state.timerLeft = state.timerSeconds;
+  $("answerInput").value = "";
+  setResult("ここに判定が出ます","");
+  backSetup();
+}
 function popConfetti(n=12){
   const box = $("confetti");
   for(let i=0;i<n;i++){
@@ -646,6 +762,18 @@ function popConfetti(n=12){
 }
 function vibrate(){ if(navigator.vibrate) navigator.vibrate([120,60,120]); }
 function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])); }
+function clearPendingNextTurn(){
+  if(state.nextTurnHandle){
+    clearTimeout(state.nextTurnHandle);
+    state.nextTurnHandle = null;
+  }
+}
+function stopAllRuntime(){
+  stopTimer();
+  stopVoiceRecognition(true);
+  stopSpeaking();
+  clearPendingNextTurn();
+}
 
 $("addPlayerBtn").addEventListener("click",()=>{ state.players.push({name:`プレイヤー${state.players.length+1}`,score:0,active:true}); renderPlayers(); saveSettings(); });
 $("resetPlayersBtn").addEventListener("click",()=>{ state.players = DEFAULT_PLAYERS.map(name=>({name,score:0,active:true})); renderPlayers(); saveSettings(); });
@@ -655,6 +783,7 @@ $("clearCategoryBtn").addEventListener("click",()=>{ state.selectedId = null; re
 $("startBtn").addEventListener("click", startGame);
 $("backSetupBtn").addEventListener("click", backSetup);
 $("newThemeBtn").addEventListener("click", newTheme);
+$("interruptBtn").addEventListener("click", interruptGame);
 $("correctBtn").addEventListener("click", manualCorrect);
 $("passBtn").addEventListener("click", pass);
 $("missBtn").addEventListener("click", miss);
@@ -667,10 +796,11 @@ $("voiceBtn").addEventListener("click", voiceAnswer);
 $("hintBtn").addEventListener("click", showHint);
 $("clearInputBtn").addEventListener("click",()=>{ $("answerInput").value=""; setResult("入力をクリアしました",""); });
 $("toggleAnswersBtn").addEventListener("click",()=>{ state.answersOpen = !state.answersOpen; renderGame(); });
+$("toggleReviewBtn").addEventListener("click",()=>{ state.reviewOpen = !state.reviewOpen; renderGame(); });
 $("markAllBtn").addEventListener("click",()=>{ state.question.answers.forEach(a=>state.used.add(a.name)); popConfetti(30); renderGame(); });
 $("clearUsedBtn").addEventListener("click",()=>{ state.used = new Set(); renderGame(); });
 
-loadSettings(); renderPlayers(); renderCategories(); setupVoice(); $("statusPill").textContent = "オフラインOK";
+loadSettings(); renderPlayers(); renderCategories(); setupVoice(); updateVoiceButton(); $("statusPill").textContent = "オフラインOK";
 </script>
 </body>
 </html>
